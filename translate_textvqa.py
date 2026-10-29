@@ -22,6 +22,7 @@ import os
 import random
 import time
 
+import pandas as pd
 import requests
 from tqdm.auto import tqdm
 from deep_translator import MyMemoryTranslator
@@ -63,6 +64,10 @@ TARGET_LANG = "id"
 # Batas per request batch: jumlah teks dan total karakter.
 MAX_TEXTS_PER_REQUEST = 50
 MAX_CHARS_PER_REQUEST = 1200
+
+# Daftarkan email di sini supaya kuota gratis MyMemory naik dari
+# ~5.000 kata/hari (anonim) jadi ~50.000 kata/hari. Ganti kalau perlu.
+MYMEMORY_EMAIL = "aditpoetra25@gmail.com"
 
 print("Folder hasil:", BASE_DIR)
 print("Folder batch:", BATCH_DIR)
@@ -191,7 +196,10 @@ def save_cache(cache, path):
 # =============================================================================
 
 # MyMemoryTranslator butuh kode bahasa berformat region (en-GB/id-ID).
-fallback_translator = MyMemoryTranslator(source="en-GB", target="id-ID")
+# Parameter email menaikkan kuota gratis dari ~5.000 jadi ~50.000 kata/hari.
+fallback_translator = MyMemoryTranslator(
+    source="en-GB", target="id-ID", email=MYMEMORY_EMAIL
+)
 
 
 class RateLimitedError(RuntimeError):
@@ -470,7 +478,52 @@ def run_batches(dataset, translation_cache):
 
 
 # =============================================================================
-# 6. MAIN
+# 6. GABUNG SEMUA BATCH -> SATU FILE CSV FINAL
+# =============================================================================
+
+def combine_batches_to_final_csv(dataset):
+    """Gabungkan seluruh batch JSONL yang sudah selesai menjadi satu CSV.
+
+    Hanya menulis FINAL_CSV_PATH kalau SEMUA data di dataset sudah
+    diterjemahkan (supaya tidak menghasilkan CSV final yang belum lengkap).
+    Urutan baris mengikuti urutan dataset asli, bukan urutan batch.
+    """
+    total_batches = (len(dataset) + BATCH_SIZE - 1) // BATCH_SIZE
+    all_records = {}
+
+    for batch_index in range(total_batches):
+        batch_id = f"B{batch_index + 1:02d}"
+        all_records.update(load_batch(get_batch_path(batch_id)))
+
+    if len(all_records) < len(dataset):
+        print(
+            f"\nBelum semua data diterjemahkan "
+            f"({len(all_records)}/{len(dataset)}). "
+            "CSV final belum dibuat. Jalankan lagi untuk melanjutkan."
+        )
+        return
+
+    rows = []
+    for row in dataset:
+        record = all_records[str(row["question_id"])]
+        rows.append({
+            "question_id": record["question_id"],
+            "image_id": record["image_id"],
+            "question": record["question"],
+            "answers": json.dumps(record["answers"], ensure_ascii=False),
+            "question_idn": record["question_idn"],
+            "answers_idn": json.dumps(record["answers_idn"], ensure_ascii=False),
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(FINAL_CSV_PATH, index=False, encoding="utf-8-sig")
+
+    print(f"\nCSV final tersimpan: {FINAL_CSV_PATH}")
+    print(f"Jumlah baris: {len(df)}")
+
+
+# =============================================================================
+# 7. MAIN
 # =============================================================================
 
 def main():
@@ -494,6 +547,7 @@ def main():
         return
 
     run_batches(dataset, translation_cache)
+    combine_batches_to_final_csv(dataset)
 
 
 if __name__ == "__main__":
