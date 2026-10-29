@@ -1,5 +1,5 @@
 """
-Terjemahan dataset TextVQA (EN -> ID) menggunakan Google Translate (scraping),
+Terjemahan dataset TextVQA (EN -> ID) menggunakan Google Translate,
 dengan fallback MyMemory, cache, dan resume antar-batch.
 
 Versi lokal (bukan Colab) dari notebook:
@@ -12,6 +12,9 @@ Perbedaan dari Colab:
 - Path hasil ditulis ke folder lokal (BASE_DIR), bukan /content/drive/...
 - TRANSLATE_DELAY diturunkan ke 0.5 detik karena jalan dari IP lokal
   (bukan IP Colab yang sudah banyak dipakai bareng, jadi lebih cepat kena 429).
+- Endpoint Google Translate memakai clients5.google.com (client=dict-chrome-ex)
+  yang menerima banyak teks sekaligus, karena endpoint scraping milik
+  deep-translator (translate.google.com/m) sekarang diblokir CAPTCHA.
 """
 
 import json
@@ -21,8 +24,7 @@ import time
 
 import requests
 from tqdm.auto import tqdm
-from deep_translator import GoogleTranslator, MyMemoryTranslator
-from deep_translator.exceptions import TooManyRequests
+from deep_translator import MyMemoryTranslator
 
 # =============================================================================
 # 1. KONFIGURASI
@@ -51,6 +53,16 @@ TRANSLATE_DELAY = 0.5
 
 MAX_RATE_LIMIT_RETRIES = 5
 RATE_LIMIT_BASE_WAIT = 30  # detik, bertambah tiap percobaan
+
+# Endpoint Google Translate yang masih jalan dan bisa menerjemahkan
+# banyak teks dalam satu request (dipakai juga oleh googletrans).
+GOOGLE_BATCH_URL = "https://clients5.google.com/translate_a/t"
+SOURCE_LANG = "en"
+TARGET_LANG = "id"
+
+# Batas per request batch: jumlah teks dan total karakter.
+MAX_TEXTS_PER_REQUEST = 50
+MAX_CHARS_PER_REQUEST = 1200
 
 print("Folder hasil:", BASE_DIR)
 print("Folder batch:", BATCH_DIR)
@@ -175,39 +187,93 @@ def save_cache(cache, path):
 
 
 # =============================================================================
-# 4. TRANSLATOR: Google Translate (scraping) + retry/backoff + fallback MyMemory
+# 4. TRANSLATOR: Google Translate (batch) + retry/backoff + fallback MyMemory
 # =============================================================================
 
-translator = GoogleTranslator(source="en", target="id")
-# MyMemoryTranslator butuh kode bahasa berformat region (en-GB/id-ID),
-# berbeda dari GoogleTranslator yang cukup "en"/"id".
+# MyMemoryTranslator butuh kode bahasa berformat region (en-GB/id-ID).
 fallback_translator = MyMemoryTranslator(source="en-GB", target="id-ID")
 
 
-def translate_text_cached(text, translation_cache):
-    text = str(text).strip()
+class RateLimitedError(RuntimeError):
+    """Google membalas 429 atau halaman blokir (CAPTCHA)."""
 
-    if not text:
-        return ""
 
-    if text in translation_cache:
-        return translation_cache[text]
+def _request_google_batch(texts):
+    """Terjemahkan beberapa teks dalam satu request. Hasil urutannya sama."""
+    params = [
+        ("client", "dict-chrome-ex"),
+        ("sl", SOURCE_LANG),
+        ("tl", TARGET_LANG),
+    ]
+    params.extend(("q", text) for text in texts)
 
-    result = None
+    response = requests.get(
+        GOOGLE_BATCH_URL,
+        params=params,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=30,
+    )
 
-    # Coba Google Translate, dengan backoff khusus saat kena rate limit
+    if response.status_code == 429:
+        raise RateLimitedError("Google membatasi permintaan (HTTP 429).")
+
+    response.raise_for_status()
+
+    try:
+        data = response.json()
+    except ValueError:
+        # Saat IP diblokir sementara, Google membalas halaman HTML "Sorry...".
+        raise RateLimitedError(
+            "Google mengembalikan halaman blokir, bukan JSON."
+        )
+
+    # Kadang hasil dibungkus satu level lagi ([[...]]) -> diratakan.
+    if isinstance(data, list) and data and isinstance(data[0], list):
+        data = data[0]
+
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"Format respons Google tidak dikenal: {str(data)[:80]!r}"
+        )
+
+    if len(data) != len(texts):
+        raise RuntimeError(
+            f"Jumlah hasil ({len(data)}) tidak sesuai "
+            f"jumlah teks ({len(texts)})."
+        )
+
+    return [str(item) for item in data]
+
+
+def _translate_with_fallback(text):
+    """Penerjemah cadangan untuk satu teks (MyMemory)."""
+    print(
+        f"\nGoogle Translate gagal terus. "
+        f"Beralih ke MyMemory Translator untuk: {text[:50]!r}"
+    )
+
+    try:
+        result = fallback_translator.translate(text)
+    except Exception as e:
+        raise RuntimeError(
+            f"Penerjemahan gagal total untuk teks: {text[:50]!r}"
+        ) from e
+
+    if not result:
+        raise RuntimeError(
+            f"Penerjemahan gagal total untuk teks: {text[:50]!r}"
+        )
+
+    return result
+
+
+def _translate_chunk(texts):
+    """Terjemahkan satu chunk teks lewat Google, dengan retry + split."""
     for attempt in range(MAX_RATE_LIMIT_RETRIES):
         try:
-            result = translator.translate(text)
+            return _request_google_batch(texts)
 
-            if result is None:
-                raise RuntimeError(
-                    "Google Translate mengembalikan hasil kosong."
-                )
-
-            break
-
-        except TooManyRequests:
+        except RateLimitedError:
             wait_time = (
                 RATE_LIMIT_BASE_WAIT * (attempt + 1)
                 + random.uniform(0, 5)
@@ -230,29 +296,77 @@ def translate_text_cached(text, translation_cache):
             )
             time.sleep(wait_time)
 
-    # Google tetap gagal setelah semua percobaan -> pakai MyMemory sebagai cadangan
-    if result is None:
-        try:
-            print(
-                f"\nGoogle Translate gagal terus. "
-                f"Beralih ke MyMemory Translator untuk: {text[:50]!r}"
-            )
-            result = fallback_translator.translate(text)
-        except Exception as e:
-            raise RuntimeError(
-                f"Penerjemahan gagal total untuk teks: {text[:50]!r}"
-            ) from e
-
-    if result is None:
-        raise RuntimeError(
-            f"Penerjemahan gagal total untuk teks: {text[:50]!r}"
+    # Google tetap gagal. Kalau chunk berisi banyak teks, pecah jadi dua
+    # supaya teks yang bermasalah tidak menjatuhkan seluruh chunk.
+    if len(texts) > 1:
+        middle = len(texts) // 2
+        print(
+            f"\nChunk {len(texts)} teks gagal. "
+            f"Membelah menjadi {middle} + {len(texts) - middle} teks."
+        )
+        return (
+            _translate_chunk(texts[:middle])
+            + _translate_chunk(texts[middle:])
         )
 
-    translation_cache[text] = result
-    save_cache(translation_cache, CACHE_PATH)
+    return [_translate_with_fallback(texts[0])]
 
-    time.sleep(TRANSLATE_DELAY + random.uniform(0, 0.8))
-    return result
+
+def translate_many(texts, translation_cache):
+    """Terjemahkan list teks sekaligus; hasil urutannya sama dengan input."""
+    texts = [str(text).strip() for text in texts]
+
+    results = {}
+    pending = []
+
+    for text in texts:
+        if not text:
+            results[text] = ""
+        elif text in translation_cache:
+            results[text] = translation_cache[text]
+        elif text not in pending:
+            pending.append(text)
+
+    chunk = []
+    chunk_chars = 0
+
+    def flush_chunk():
+        nonlocal chunk, chunk_chars
+
+        if not chunk:
+            return
+
+        translated = _translate_chunk(chunk)
+
+        for source_text, translated_text in zip(chunk, translated):
+            translation_cache[source_text] = translated_text
+            results[source_text] = translated_text
+
+        save_cache(translation_cache, CACHE_PATH)
+
+        chunk = []
+        chunk_chars = 0
+
+        time.sleep(TRANSLATE_DELAY + random.uniform(0, 0.8))
+
+    for text in pending:
+        too_many = len(chunk) >= MAX_TEXTS_PER_REQUEST
+        too_long = chunk_chars + len(text) > MAX_CHARS_PER_REQUEST
+
+        if chunk and (too_many or too_long):
+            flush_chunk()
+
+        chunk.append(text)
+        chunk_chars += len(text)
+
+    flush_chunk()
+
+    return [results[text] for text in texts]
+
+
+def translate_text_cached(text, translation_cache):
+    return translate_many([text], translation_cache)[0]
+
 
 
 # =============================================================================
@@ -318,12 +432,12 @@ def run_batches(dataset, translation_cache):
                 question_en = row["question"]
                 answers_en = row["answers"]
 
-                question_idn = translate_text_cached(question_en, translation_cache)
-
-                answers_idn = [
-                    translate_text_cached(answer, translation_cache)
-                    for answer in answers_en
-                ]
+                translated = translate_many(
+                    [question_en] + answers_en,
+                    translation_cache,
+                )
+                question_idn = translated[0]
+                answers_idn = translated[1:]
 
                 record = {
                     "batch_id": batch_id,
