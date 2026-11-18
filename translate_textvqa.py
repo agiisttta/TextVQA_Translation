@@ -20,6 +20,7 @@ Perbedaan dari Colab:
 import json
 import os
 import random
+import sys
 import time
 
 import pandas as pd
@@ -67,7 +68,7 @@ MAX_CHARS_PER_REQUEST = 1200
 
 # Daftarkan email di sini supaya kuota gratis MyMemory naik dari
 # ~5.000 kata/hari (anonim) jadi ~50.000 kata/hari. Ganti kalau perlu.
-MYMEMORY_EMAIL = "aditpoetra25@gmail.com"
+MYMEMORY_EMAIL = "agiisttta@gmail.com"
 
 print("Folder hasil:", BASE_DIR)
 print("Folder batch:", BATCH_DIR)
@@ -551,4 +552,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--export-only" in sys.argv:
+        # Hanya menggabungkan batch yang sudah lengkap, tanpa menerjemahkan.
+        combine_batches_to_final_csv(fetch_dataset_from_hf())
+    else:
+        main()

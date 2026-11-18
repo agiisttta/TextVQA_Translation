@@ -1,4 +1,8 @@
 venv/
 __pycache__/
 *.pyc
-result/
+.DS_Store
+
+# Hasil translation: simpan hanya CSV final, abaikan file kerja.
+result/*
+!result/textvqa_5000_translated.csv
